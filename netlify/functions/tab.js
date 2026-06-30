@@ -23,8 +23,22 @@ const json = (status, body) => ({
   body: JSON.stringify(body),
 });
 
+// Build the store. When Netlify auto-injects Blobs context, getStore({name})
+// just works. When it doesn't (some deploy setups), fall back to the manual
+// siteID + token that Netlify asks for, read from environment variables.
+function openStore() {
+  const opts = { name: STORE, consistency: "strong" };
+  const siteID = process.env.NETLIFY_SITE_ID;
+  const token = process.env.NETLIFY_BLOBS_TOKEN;
+  if (siteID && token) {
+    opts.siteID = siteID;
+    opts.token = token;
+  }
+  return getStore(opts);
+}
+
 export const handler = async (event) => {
-  const store = getStore({ name: STORE, consistency: "strong" });
+  const store = openStore();
 
   try {
     if (event.httpMethod === "GET") {
