@@ -1,0 +1,376 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no" />
+<meta name="theme-color" content="#FBF7F2" />
+<meta name="apple-mobile-web-app-capable" content="yes" />
+<meta name="apple-mobile-web-app-title" content="Shared Tab" />
+<title>Shared Tab — Grad Party</title>
+<link rel="preconnect" href="https://fonts.googleapis.com" />
+<link href="https://fonts.googleapis.com/css2?family=Fraunces:opsz,wght@9..144,400;9..144,600&family=Inter:wght@400;500;600&display=swap" rel="stylesheet" />
+<script src="https://unpkg.com/react@18/umd/react.production.min.js" crossorigin></script>
+<script src="https://unpkg.com/react-dom@18/umd/react-dom.production.min.js" crossorigin></script>
+<script src="https://unpkg.com/@babel/standalone/babel.min.js"></script>
+<style>
+  * { box-sizing: border-box; -webkit-tap-highlight-color: transparent; }
+  html, body { margin: 0; padding: 0; background: #FBF7F2; overscroll-behavior: none; }
+  body { font-family: 'Inter', system-ui, sans-serif; }
+  input { font-family: inherit; }
+  button { font-family: inherit; }
+  ::-webkit-scrollbar { width: 0; }
+  @media (prefers-reduced-motion: reduce) { * { transition: none !important; } }
+</style>
+</head>
+<body>
+<div id="root"></div>
+<script type="text/babel" data-presets="react">
+const { useState, useEffect, useMemo, useCallback, useRef } = React;
+
+/* ---------------- config ---------------- */
+const API = "/api/tab";
+const POLL_MS = 4000;
+
+/* ---------------- money ---------------- */
+const toCents = (s) => Math.round(parseFloat(String(s||"0").replace(/[^0-9.]/g,""))*100) || 0;
+const fmtPlain = (c) => `$${(Math.abs(c)/100).toLocaleString("en-US",{minimumFractionDigits:2,maximumFractionDigits:2})}`;
+const fmtSigned = (c) => (c<0?"−":"")+fmtPlain(c);
+function splitEqually(amount, n){
+  if(n<=0) return [];
+  const base=Math.floor(amount/n); let rem=amount-base*n;
+  return Array.from({length:n},()=>{ const e=rem>0?1:0; rem-=e; return base+e; });
+}
+
+/* ---------------- balance engine ---------------- */
+function computeBalances(people, expenses){
+  const paid={}, owes={};
+  people.forEach(p=>{paid[p.id]=0;owes[p.id]=0;});
+  expenses.forEach(e=>{
+    if(paid[e.payer]===undefined) return;
+    paid[e.payer]+=e.amount;
+    Object.entries(e.shares).forEach(([pid,s])=>{ if(owes[pid]!==undefined) owes[pid]+=s; });
+  });
+  return people.map(p=>({...p,paid:paid[p.id],owes:owes[p.id],net:paid[p.id]-owes[p.id]}));
+}
+function settle(balances){
+  const debtors=balances.filter(b=>b.net<0).map(b=>({name:b.name,amt:-b.net}));
+  const creditors=balances.filter(b=>b.net>0).map(b=>({name:b.name,amt:b.net}));
+  debtors.sort((a,b)=>b.amt-a.amt); creditors.sort((a,b)=>b.amt-a.amt);
+  const out=[]; let i=0,j=0;
+  while(i<debtors.length && j<creditors.length){
+    const pay=Math.min(debtors[i].amt,creditors[j].amt);
+    if(pay>0) out.push({from:debtors[i].name,to:creditors[j].name,amount:pay});
+    debtors[i].amt-=pay; creditors[j].amt-=pay;
+    if(debtors[i].amt===0)i++; if(creditors[j].amt===0)j++;
+  }
+  return out;
+}
+
+/* ---------------- palette ---------------- */
+const C={bg:"#FBF7F2",card:"#FFFFFF",ink:"#2E2A39",muted:"#8C8597",line:"#ECE4DC",plum:"#6D4C7D",plumSoft:"#F1E9F3",gold:"#C9A24B",green:"#3F8F6B",greenSoft:"#E6F1EB",rose:"#C06A78",roseSoft:"#F7E9EC"};
+const TINTS=[["#F1E9F3","#6D4C7D"],["#E6F1EB","#3F8F6B"],["#F7E9EC","#C06A78"],["#FBF1DE","#B5862B"],["#E8EEF5","#4C6E8F"],["#F3ECE4","#9A7B53"]];
+const initials=(n)=>n.trim().split(/\s+/).slice(0,2).map(w=>w[0]?.toUpperCase()||"").join("");
+function Avatar({name,idx,size=40}){
+  const [bg,fg]=TINTS[idx%TINTS.length];
+  return <div style={{width:size,height:size,borderRadius:"50%",background:bg,color:fg,display:"flex",alignItems:"center",justifyContent:"center",fontWeight:600,fontSize:size*0.38,flexShrink:0,fontFamily:"'Fraunces',serif"}}>{initials(name)}</div>;
+}
+
+/* ---------------- app ---------------- */
+function App(){
+  const [state,setState]=useState(null);
+  const [tab,setTab]=useState("feed");
+  const [showAdd,setShowAdd]=useState(false);
+  const [editing,setEditing]=useState(null);
+  const [detail,setDetail]=useState(null);
+  const [status,setStatus]=useState("loading"); // loading | ok | error | saving
+  const dirty=useRef(false);
+
+  const fetchTab=useCallback(async()=>{
+    if(dirty.current) return; // don't clobber a local edit mid-flight
+    try{
+      const r=await fetch(API,{cache:"no-store"});
+      if(!r.ok) throw 0;
+      const data=await r.json();
+      setState(data); setStatus("ok");
+    }catch{ setStatus(s=>s==="loading"?"error":s); }
+  },[]);
+
+  useEffect(()=>{ fetchTab(); const t=setInterval(fetchTab,POLL_MS); return ()=>clearInterval(t); },[fetchTab]);
+
+  const persist=useCallback(async(next)=>{
+    dirty.current=true; setState(next); setStatus("saving");
+    try{
+      const r=await fetch(API,{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify(next)});
+      if(!r.ok) throw 0;
+      setStatus("ok");
+    }catch{ setStatus("error"); }
+    finally{ dirty.current=false; }
+  },[]);
+
+  const balances=useMemo(()=>state?computeBalances(state.people,state.expenses):[],[state]);
+  const payments=useMemo(()=>settle(balances),[balances]);
+  const personById=useCallback(id=>state?.people.find(p=>p.id===id),[state]);
+  const idxOf=useCallback(id=>state?.people.findIndex(p=>p.id===id)??0,[state]);
+
+  if(!state){
+    return <div style={{...wrap,alignItems:"center",justifyContent:"center",color:C.muted}}>
+      {status==="error"? "Couldn't load the tab — pull down to retry." : "Setting the table…"}
+    </div>;
+  }
+
+  const addOrUpdate=(exp)=>{
+    const next={...state};
+    if(exp.id) next.expenses=next.expenses.map(e=>e.id===exp.id?exp:e);
+    else next.expenses=[...next.expenses,{...exp,id:"e"+Date.now()+Math.random().toString(36).slice(2,6),ts:Date.now()}];
+    persist(next); setShowAdd(false); setEditing(null);
+  };
+  const deleteExpense=(id)=>{ persist({...state,expenses:state.expenses.filter(e=>e.id!==id)}); setDetail(null); };
+  const addPerson=(name)=>{ if(!name.trim())return; persist({...state,people:[...state.people,{id:"p"+Date.now(),name:name.trim()}]}); };
+
+  const feed=[...state.expenses].sort((a,b)=>b.ts-a.ts);
+  const totalSpent=state.expenses.reduce((s,e)=>s+e.amount,0);
+
+  return <div style={wrap}>
+    <header style={header}>
+      <div style={{display:"flex",alignItems:"center",gap:10}}>
+        <span style={{fontSize:18}}>✦</span>
+        <span style={{fontFamily:"'Fraunces',serif",fontWeight:600,color:C.ink,fontSize:15}}>Shared Tab</span>
+      </div>
+      <Status status={status}/>
+    </header>
+
+    <div style={hero}>
+      <div style={{fontSize:13,color:C.muted,letterSpacing:.3}}>Spent together so far</div>
+      <div style={heroAmount}>{fmtPlain(totalSpent)}</div>
+      <div style={{fontSize:13,color:C.muted}}>{state.expenses.length} {state.expenses.length===1?"item":"items"} · {state.people.length} hosts</div>
+    </div>
+
+    <nav style={tabBar}>
+      {[["feed","Activity"],["balances","Who's up"],["settle","Settle up"]].map(([k,l])=>(
+        <button key={k} onClick={()=>setTab(k)} style={{...tabBtn,color:tab===k?C.ink:C.muted,borderBottom:tab===k?`2px solid ${C.plum}`:"2px solid transparent",fontWeight:tab===k?600:500}}>{l}</button>
+      ))}
+    </nav>
+
+    <main style={{flex:1,overflowY:"auto",WebkitOverflowScrolling:"touch",padding:"4px 18px 130px"}}>
+      {tab==="feed" && <Feed feed={feed} personById={personById} idxOf={idxOf} onTap={setDetail}/>}
+      {tab==="balances" && <Balances balances={balances} idxOf={idxOf} onAddPerson={addPerson}/>}
+      {tab==="settle" && <Settle payments={payments} state={state}/>}
+    </main>
+
+    <button style={fab} onClick={()=>{setEditing(null);setShowAdd(true);}} aria-label="Add expense">+</button>
+
+    {(showAdd||editing) && <ExpenseSheet people={state.people} initial={editing} onClose={()=>{setShowAdd(false);setEditing(null);}} onSave={addOrUpdate}/>}
+    {detail && <DetailSheet expense={detail} personById={personById} idxOf={idxOf} onClose={()=>setDetail(null)} onEdit={(e)=>{setDetail(null);setEditing(e);}} onDelete={deleteExpense}/>}
+  </div>;
+}
+
+function Status({status}){
+  const map={ok:[C.green,"Saved"],saving:[C.gold,"Saving…"],error:[C.rose,"Offline"],loading:[C.muted,"…"]};
+  const [col,txt]=map[status]||map.loading;
+  return <span style={{display:"flex",alignItems:"center",gap:6,fontSize:12,color:C.muted}}>
+    <span style={{width:7,height:7,borderRadius:"50%",background:col}}/>{txt}
+  </span>;
+}
+
+function Feed({feed,personById,idxOf,onTap}){
+  if(feed.length===0) return <Empty title="Nothing on the tab yet" body="Add the first expense — catering, the cake, balloons — and everyone's share sorts itself out."/>;
+  return <div style={{display:"flex",flexDirection:"column",gap:12,paddingTop:14}}>
+    {feed.map(e=>{
+      const payer=personById(e.payer);
+      const names=Object.keys(e.shares).map(id=>personById(id)?.name).filter(Boolean);
+      return <button key={e.id} onClick={()=>onTap(e)} style={feedCard}>
+        <Avatar name={payer?.name||"?"} idx={idxOf(e.payer)}/>
+        <div style={{flex:1,minWidth:0,textAlign:"left"}}>
+          <div style={{color:C.ink,fontSize:15}}><strong style={{fontWeight:600}}>{payer?.name}</strong><span style={{color:C.muted}}> paid </span><strong style={{fontWeight:600}}>{fmtPlain(e.amount)}</strong></div>
+          <div style={{color:C.ink,fontSize:14,marginTop:2,fontFamily:"'Fraunces',serif"}}>{e.description}</div>
+          <div style={{color:C.muted,fontSize:12.5,marginTop:4,overflow:"hidden",textOverflow:"ellipsis",whiteSpace:"nowrap"}}>Split between {names.join(", ")}</div>
+        </div>
+      </button>;
+    })}
+  </div>;
+}
+
+function Balances({balances,idxOf,onAddPerson}){
+  const [newName,setNewName]=useState("");
+  const maxAbs=Math.max(1,...balances.map(b=>Math.abs(b.net)));
+  return <div style={{paddingTop:14}}>
+    <div style={{display:"flex",flexDirection:"column",gap:12}}>
+      {balances.map(b=>{
+        const up=b.net>=0; const pct=Math.round((Math.abs(b.net)/maxAbs)*100);
+        return <div key={b.id} style={balCard}>
+          <div style={{display:"flex",alignItems:"center",gap:12,marginBottom:12}}>
+            <Avatar name={b.name} idx={idxOf(b.id)}/>
+            <div style={{flex:1}}>
+              <div style={{color:C.ink,fontWeight:600,fontSize:15}}>{b.name}</div>
+              <div style={{color:C.muted,fontSize:12.5}}>Paid {fmtPlain(b.paid)} · Owes {fmtPlain(b.owes)}</div>
+            </div>
+            <div style={{fontFamily:"'Fraunces',serif",fontWeight:600,fontSize:18,color:b.net===0?C.muted:up?C.green:C.rose}}>{b.net===0?"even":(up?"+":"")+fmtSigned(b.net)}</div>
+          </div>
+          <div style={{height:6,background:C.line,borderRadius:99,overflow:"hidden"}}>
+            <div style={{width:`${pct}%`,height:"100%",background:b.net===0?C.muted:up?C.green:C.rose,borderRadius:99,transition:"width .5s cubic-bezier(.2,.8,.2,1)"}}/>
+          </div>
+          <div style={{fontSize:11.5,color:C.muted,marginTop:6}}>{b.net===0?"All square":up?"Gets paid back":"Owes the group"}</div>
+        </div>;
+      })}
+    </div>
+    <div style={{...balCard,marginTop:16,display:"flex",gap:8,alignItems:"center"}}>
+      <input value={newName} onChange={e=>setNewName(e.target.value)} placeholder="Add a host…" style={{...input,flex:1,marginBottom:0}}/>
+      <button onClick={()=>{onAddPerson(newName);setNewName("");}} style={{...miniBtn,background:C.plum,color:"#fff"}}>Add</button>
+    </div>
+  </div>;
+}
+
+function Settle({payments,state}){
+  const nameIdx=(n)=>state.people.findIndex(p=>p.name===n);
+  if(payments.length===0) return <Empty title="Everyone's square" body="No payments needed right now. Add expenses and the simplest way to settle up will show here."/>;
+  return <div style={{paddingTop:14}}>
+    <p style={{color:C.muted,fontSize:13.5,lineHeight:1.5,margin:"0 0 14px"}}>The fewest payments to make everyone even. Once these clear, the tab resets to zero.</p>
+    <div style={{display:"flex",flexDirection:"column",gap:12}}>
+      {payments.map((p,i)=>(
+        <div key={i} style={settleRow}>
+          <Avatar name={p.from} idx={Math.max(0,nameIdx(p.from))} size={36}/>
+          <div style={{flex:1,display:"flex",alignItems:"center",gap:8,minWidth:0}}>
+            <span style={{color:C.ink,fontWeight:600,fontSize:14}}>{p.from}</span>
+            <span style={{color:C.plum,fontSize:18,lineHeight:1}}>→</span>
+            <span style={{color:C.ink,fontWeight:600,fontSize:14}}>{p.to}</span>
+          </div>
+          <span style={{fontFamily:"'Fraunces',serif",fontWeight:600,fontSize:17,color:C.green}}>{fmtPlain(p.amount)}</span>
+        </div>
+      ))}
+    </div>
+  </div>;
+}
+
+function ExpenseSheet({people,initial,onClose,onSave}){
+  const [amount,setAmount]=useState(initial?(initial.amount/100).toFixed(2):"");
+  const [desc,setDesc]=useState(initial?.description||"");
+  const [payer,setPayer]=useState(initial?.payer||people[0]?.id);
+  const [splitWith,setSplitWith]=useState(initial?Object.keys(initial.shares):people.map(p=>p.id));
+  const [mode,setMode]=useState(initial?.mode||"equal");
+  const [custom,setCustom]=useState(()=>{const c={};if(initial&&initial.mode==="custom")Object.entries(initial.shares).forEach(([id,v])=>c[id]=(v/100).toFixed(2));return c;});
+  const amtCents=toCents(amount);
+  const customSum=splitWith.reduce((s,id)=>s+toCents(custom[id]),0);
+  const customOk=mode==="equal"||customSum===amtCents;
+  const valid=amtCents>0&&desc.trim()&&payer&&splitWith.length>0&&customOk;
+  const toggle=(id)=>setSplitWith(p=>p.includes(id)?p.filter(x=>x!==id):[...p,id]);
+  const save=()=>{
+    let shares={};
+    if(mode==="equal"){const parts=splitEqually(amtCents,splitWith.length);splitWith.forEach((id,i)=>shares[id]=parts[i]);}
+    else splitWith.forEach(id=>shares[id]=toCents(custom[id]));
+    onSave({id:initial?.id,ts:initial?.ts,amount:amtCents,description:desc.trim(),payer,shares,mode});
+  };
+  return <Sheet onClose={onClose} title={initial?"Edit expense":"Add expense"}>
+    <label style={lbl}>Amount</label>
+    <div style={{position:"relative",marginBottom:14}}>
+      <span style={{position:"absolute",left:14,top:13,color:C.muted,fontSize:20,fontFamily:"'Fraunces',serif"}}>$</span>
+      <input value={amount} onChange={e=>setAmount(e.target.value)} placeholder="0.00" inputMode="decimal" style={{...input,paddingLeft:30,fontSize:22,fontFamily:"'Fraunces',serif",marginBottom:0}} autoFocus/>
+    </div>
+    <label style={lbl}>What for</label>
+    <input value={desc} onChange={e=>setDesc(e.target.value)} placeholder="Catering, cake, decorations…" style={input}/>
+    <label style={lbl}>Who paid</label>
+    <div style={chipWrap}>
+      {people.map(p=>(<button key={p.id} onClick={()=>setPayer(p.id)} style={{...chip,background:payer===p.id?C.plum:C.card,color:payer===p.id?"#fff":C.ink,borderColor:payer===p.id?C.plum:C.line}}>{p.name}</button>))}
+    </div>
+    <div style={{display:"flex",justifyContent:"space-between",alignItems:"baseline",marginTop:14}}>
+      <label style={{...lbl,marginBottom:0}}>Split between</label>
+      <div style={{display:"flex",gap:4}}>
+        {["equal","custom"].map(m=>(<button key={m} onClick={()=>setMode(m)} style={{...miniToggle,background:mode===m?C.plumSoft:"transparent",color:mode===m?C.plum:C.muted}}>{m==="equal"?"Equal":"Custom"}</button>))}
+      </div>
+    </div>
+    <div style={{marginTop:8,display:"flex",flexDirection:"column",gap:8}}>
+      {people.map(p=>{
+        const on=splitWith.includes(p.id);
+        const eq=on&&mode==="equal"?splitEqually(amtCents,splitWith.length)[splitWith.indexOf(p.id)]:0;
+        return <div key={p.id} style={{display:"flex",alignItems:"center",gap:10}}>
+          <button onClick={()=>toggle(p.id)} style={{...checkbox,background:on?C.plum:"#fff",borderColor:on?C.plum:C.line}}>{on&&<span style={{color:"#fff",fontSize:14,fontWeight:700}}>✓</span>}</button>
+          <span style={{flex:1,color:on?C.ink:C.muted,fontSize:14.5}}>{p.name}</span>
+          {on&&mode==="equal"&&<span style={{color:C.muted,fontSize:13,fontFamily:"'Fraunces',serif"}}>{fmtPlain(eq)}</span>}
+          {on&&mode==="custom"&&<div style={{position:"relative",width:90}}>
+            <span style={{position:"absolute",left:8,top:7,color:C.muted,fontSize:13}}>$</span>
+            <input value={custom[p.id]||""} onChange={e=>setCustom({...custom,[p.id]:e.target.value})} placeholder="0.00" inputMode="decimal" style={{...input,marginBottom:0,padding:"6px 6px 6px 18px",fontSize:13.5,textAlign:"right"}}/>
+          </div>}
+        </div>;
+      })}
+    </div>
+    {mode==="custom"&&<div style={{fontSize:12.5,marginTop:8,color:customOk?C.green:C.rose}}>{customOk?"Adds up — looks good":`${fmtPlain(customSum)} of ${fmtPlain(amtCents)} (off by ${fmtPlain(Math.abs(amtCents-customSum))})`}</div>}
+    <button onClick={save} disabled={!valid} style={{...primaryBtn,opacity:valid?1:.4,marginTop:18}}>{initial?"Save changes":"Add to tab"}</button>
+  </Sheet>;
+}
+
+function DetailSheet({expense,personById,idxOf,onClose,onEdit,onDelete}){
+  const [confirm,setConfirm]=useState(false);
+  const payer=personById(expense.payer);
+  return <Sheet onClose={onClose} title={expense.description}>
+    <div style={{display:"flex",alignItems:"center",gap:12,marginBottom:18}}>
+      <Avatar name={payer?.name||"?"} idx={idxOf(expense.payer)} size={48}/>
+      <div>
+        <div style={{fontFamily:"'Fraunces',serif",fontSize:26,fontWeight:600,color:C.ink}}>{fmtPlain(expense.amount)}</div>
+        <div style={{color:C.muted,fontSize:13}}>{payer?.name} paid · split {expense.mode}</div>
+      </div>
+    </div>
+    <label style={lbl}>Breakdown</label>
+    <div style={{display:"flex",flexDirection:"column",gap:8,marginTop:4}}>
+      {Object.entries(expense.shares).map(([id,share])=>{
+        const pers=personById(id);
+        return <div key={id} style={{display:"flex",alignItems:"center",gap:10}}>
+          <Avatar name={pers?.name||"?"} idx={idxOf(id)} size={30}/>
+          <span style={{flex:1,color:C.ink,fontSize:14.5}}>{pers?.name}</span>
+          <span style={{fontFamily:"'Fraunces',serif",color:C.ink,fontSize:14.5}}>{fmtPlain(share)}</span>
+        </div>;
+      })}
+    </div>
+    <div style={{display:"flex",gap:10,marginTop:22}}>
+      <button onClick={()=>onEdit(expense)} style={{...primaryBtn,flex:1,background:C.plumSoft,color:C.plum}}>Edit</button>
+      {confirm
+        ? <button onClick={()=>onDelete(expense.id)} style={{...primaryBtn,flex:1,background:C.rose}}>Tap to confirm</button>
+        : <button onClick={()=>setConfirm(true)} style={{...primaryBtn,flex:1,background:C.roseSoft,color:C.rose}}>Delete</button>}
+    </div>
+  </Sheet>;
+}
+
+function Sheet({children,onClose,title}){
+  return <div style={overlay} onClick={onClose}>
+    <div style={sheet} onClick={e=>e.stopPropagation()}>
+      <div style={{display:"flex",alignItems:"center",justifyContent:"space-between",marginBottom:18}}>
+        <h2 style={{margin:0,fontFamily:"'Fraunces',serif",fontSize:19,fontWeight:600,color:C.ink}}>{title}</h2>
+        <button onClick={onClose} style={closeBtn}>✕</button>
+      </div>
+      {children}
+    </div>
+  </div>;
+}
+function Empty({title,body}){
+  return <div style={{textAlign:"center",padding:"60px 20px",color:C.muted}}>
+    <div style={{width:54,height:54,borderRadius:"50%",background:C.plumSoft,display:"flex",alignItems:"center",justifyContent:"center",margin:"0 auto 16px",fontSize:24}}>🧾</div>
+    <div style={{fontFamily:"'Fraunces',serif",fontSize:18,color:C.ink,marginBottom:6}}>{title}</div>
+    <p style={{fontSize:14,lineHeight:1.55,maxWidth:280,margin:"0 auto"}}>{body}</p>
+  </div>;
+}
+
+/* ---------------- styles ---------------- */
+const wrap={maxWidth:480,margin:"0 auto",minHeight:"100vh",height:"100dvh",display:"flex",flexDirection:"column",background:C.bg,color:C.ink,position:"relative",overflow:"hidden"};
+const header={display:"flex",alignItems:"center",justifyContent:"space-between",padding:"16px 18px 8px"};
+const hero={padding:"8px 18px 16px",textAlign:"center"};
+const heroAmount={fontFamily:"'Fraunces',serif",fontSize:44,fontWeight:600,color:C.ink,lineHeight:1.1,margin:"2px 0"};
+const tabBar={display:"flex",borderBottom:`1px solid ${C.line}`,padding:"0 18px",gap:22};
+const tabBtn={background:"none",border:"none",padding:"10px 0",fontSize:14,cursor:"pointer"};
+const feedCard={display:"flex",gap:12,alignItems:"flex-start",background:C.card,border:`1px solid ${C.line}`,borderRadius:16,padding:14,cursor:"pointer",width:"100%"};
+const balCard={background:C.card,border:`1px solid ${C.line}`,borderRadius:16,padding:16};
+const settleRow={display:"flex",alignItems:"center",gap:12,background:C.card,border:`1px solid ${C.line}`,borderRadius:16,padding:"12px 14px"};
+const fab={position:"fixed",bottom:28,right:"max(24px, calc(50% - 240px + 24px))",width:60,height:60,borderRadius:"50%",background:C.plum,color:"#fff",border:"none",fontSize:30,lineHeight:1,cursor:"pointer",boxShadow:"0 8px 24px rgba(109,76,125,.4)",zIndex:40};
+const overlay={position:"fixed",inset:0,background:"rgba(46,42,57,.4)",display:"flex",alignItems:"flex-end",justifyContent:"center",zIndex:50};
+const sheet={background:C.bg,width:"100%",maxWidth:480,borderRadius:"22px 22px 0 0",padding:"20px 18px 28px",maxHeight:"92vh",overflowY:"auto",boxShadow:"0 -8px 40px rgba(0,0,0,.18)"};
+const closeBtn={background:C.line,border:"none",width:30,height:30,borderRadius:"50%",cursor:"pointer",color:C.muted,fontSize:14};
+const lbl={display:"block",fontSize:12.5,fontWeight:600,color:C.muted,marginBottom:6,letterSpacing:.2,textTransform:"uppercase"};
+const input={width:"100%",boxSizing:"border-box",padding:"12px 14px",borderRadius:12,border:`1px solid ${C.line}`,background:C.card,fontSize:15,color:C.ink,marginBottom:14,outline:"none"};
+const chipWrap={display:"flex",flexWrap:"wrap",gap:8};
+const chip={padding:"8px 14px",borderRadius:99,border:`1px solid ${C.line}`,fontSize:13.5,cursor:"pointer",fontWeight:500};
+const miniToggle={padding:"4px 12px",borderRadius:99,border:"none",fontSize:12.5,cursor:"pointer",fontWeight:600};
+const checkbox={width:24,height:24,borderRadius:7,border:`1.5px solid ${C.line}`,display:"flex",alignItems:"center",justifyContent:"center",cursor:"pointer",flexShrink:0};
+const primaryBtn={width:"100%",padding:"14px",borderRadius:14,border:"none",background:C.plum,color:"#fff",fontSize:15,fontWeight:600,cursor:"pointer"};
+const miniBtn={padding:"10px 16px",borderRadius:12,border:"none",fontSize:14,fontWeight:600,cursor:"pointer"};
+
+ReactDOM.createRoot(document.getElementById("root")).render(<App/>);
+</script>
+</body>
+</html>
